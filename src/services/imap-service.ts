@@ -250,11 +250,11 @@ export class ImapService {
       uidValidity: true,
     });
     return {
-      messages: status.messages ?? 0,
-      recent: status.recent ?? 0,
-      unseen: status.unseen ?? 0,
-      uidValidity: status.uidValidity ?? 0,
-      uidNext: status.uidNext ?? 0,
+      messages: Number(status.messages ?? 0),
+      recent: Number(status.recent ?? 0),
+      unseen: Number(status.unseen ?? 0),
+      uidValidity: Number(status.uidValidity ?? 0),
+      uidNext: Number(status.uidNext ?? 0),
     };
   }
 
