@@ -234,6 +234,30 @@ export class ImapService {
     return await client.mailboxOpen(folderName);
   }
 
+  async getFolderStatus(accountId: string, folderName: string): Promise<{
+    messages: number;
+    recent: number;
+    unseen: number;
+    uidValidity: number;
+    uidNext: number;
+  }> {
+    const client = await this.ensureConnected(accountId);
+    const status = await client.status(folderName, {
+      messages: true,
+      recent: true,
+      unseen: true,
+      uidNext: true,
+      uidValidity: true,
+    });
+    return {
+      messages: status.messages ?? 0,
+      recent: status.recent ?? 0,
+      unseen: status.unseen ?? 0,
+      uidValidity: status.uidValidity ?? 0,
+      uidNext: status.uidNext ?? 0,
+    };
+  }
+
   async searchEmails(accountId: string, folderName: string, criteria: SearchCriteria): Promise<EmailMessage[]> {
     const client = await this.ensureConnected(accountId);
 

@@ -40,22 +40,20 @@ export function folderTools(
       folder: z.string().describe('Folder name'),
     }
   }, async ({ accountId, folder }) => {
-    const box = await imapService.selectFolder(accountId, folder);
-    
+    const status = await imapService.getFolderStatus(accountId, folder);
+
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
           folder: folder,
           messages: {
-            total: box.messages.total,
-            new: box.messages.new,
-            unseen: box.messages.unseen || 0,
+            total: status.messages,
+            recent: status.recent,
+            unseen: status.unseen,
           },
-          uidvalidity: box.uidvalidity,
-          uidnext: box.uidnext,
-          flags: box.flags,
-          permanentFlags: box.permanentFlags,
+          uidValidity: status.uidValidity,
+          uidNext: status.uidNext,
         }, null, 2)
       }]
     };
