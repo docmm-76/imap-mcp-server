@@ -40,23 +40,37 @@ export function folderTools(
       folder: z.string().describe('Folder name'),
     }
   }, async ({ accountId, folder }) => {
-    const status = await imapService.getFolderStatus(accountId, folder);
+    try {
+      const status = await imapService.getFolderStatus(accountId, folder);
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          folder: folder,
-          messages: {
-            total: status.messages,
-            recent: status.recent,
-            unseen: status.unseen,
-          },
-          uidValidity: status.uidValidity,
-          uidNext: status.uidNext,
-        }, null, 2)
-      }]
-    };
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            folder: folder,
+            messages: {
+              total: status.messages,
+              recent: status.recent,
+              unseen: status.unseen,
+            },
+            uidValidity: status.uidValidity,
+            uidNext: status.uidNext,
+          }, null, 2)
+        }]
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            folder,
+            error: message,
+          }, null, 2)
+        }]
+      };
+    }
   });
 
   // Get unread count tool
