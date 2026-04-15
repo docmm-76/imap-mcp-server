@@ -81,6 +81,28 @@ function enrichConnectionError(error: unknown, host: string): string {
   return originalMessage;
 }
 
+/**
+ * Classic Levenshtein distance; used for "did you mean" suggestions when
+ * a caller passes an unknown folder name.
+ */
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const prev = new Array(b.length + 1);
+  const curr = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+  }
+  return prev[b.length];
+}
+
 interface ConnectionState {
   client: ImapFlow;
   account: ImapAccount;
@@ -212,7 +234,7 @@ export class ImapService {
       folders.push({
         name: folder.path,
         delimiter: folder.delimiter,
-        attributes: folder.flags || [],
+        attributes: this.normalizeFlags((folder as any).flags),
         children: folder.folders ? this.convertFolderList(folder.folders) : undefined,
       });
     }
@@ -224,9 +246,24 @@ export class ImapService {
     return folders.map(f => ({
       name: f.path,
       delimiter: f.delimiter,
-      attributes: f.flags || [],
+      attributes: this.normalizeFlags(f.flags),
       children: f.folders ? this.convertFolderList(f.folders) : undefined,
     }));
+  }
+
+  /**
+   * imapflow returns mailbox flags as a Set, which JSON.stringify serializes
+   * to `{}`. Convert to a plain string array so callers (and MCP clients)
+   * can actually see flags like `\Noselect` or `\HasChildren`.
+   */
+  private normalizeFlags(flags: unknown): string[] {
+    if (!flags) return [];
+    if (Array.isArray(flags)) return flags.map(String);
+    if (flags instanceof Set) return Array.from(flags, String);
+    if (typeof (flags as any)[Symbol.iterator] === 'function') {
+      return Array.from(flags as Iterable<unknown>, String);
+    }
+    return [];
   }
 
   async selectFolder(accountId: string, folderName: string): Promise<any> {
@@ -242,20 +279,104 @@ export class ImapService {
     uidNext: number;
   }> {
     const client = await this.ensureConnected(accountId);
-    const status = await client.status(folderName, {
-      messages: true,
-      recent: true,
-      unseen: true,
-      uidNext: true,
-      uidValidity: true,
-    });
-    return {
-      messages: Number(status.messages ?? 0),
-      recent: Number(status.recent ?? 0),
-      unseen: Number(status.unseen ?? 0),
-      uidValidity: Number(status.uidValidity ?? 0),
-      uidNext: Number(status.uidNext ?? 0),
-    };
+
+    // 1. Resolve the requested name against the actual folder list.
+    //    This catches typos, missing @-prefixes, case mismatches, etc.
+    const availableFolders = await this.collectFolderPaths(client);
+    const resolved = this.resolveFolderName(folderName, availableFolders);
+
+    if (!resolved.match) {
+      const suggestions = resolved.suggestions.length > 0
+        ? ` Did you mean: ${resolved.suggestions.map(s => `"${s}"`).join(', ')}?`
+        : '';
+      throw new Error(
+        `Folder "${folderName}" not found on server.${suggestions} ` +
+        `Use imap_list_folders to see all available folders.`
+      );
+    }
+
+    const targetFolder = resolved.match;
+
+    // 2. Try STATUS first. This is the cheap path but fails when the
+    //    folder is currently selected (RFC 3501: "STATUS MUST NOT be used
+    //    on the currently selected mailbox") or has the \Noselect flag.
+    try {
+      const status = await client.status(targetFolder, {
+        messages: true,
+        recent: true,
+        unseen: true,
+        uidNext: true,
+        uidValidity: true,
+      });
+      return {
+        messages: Number(status.messages ?? 0),
+        recent: Number(status.recent ?? 0),
+        unseen: Number(status.unseen ?? 0),
+        uidValidity: Number(status.uidValidity ?? 0),
+        uidNext: Number(status.uidNext ?? 0),
+      };
+    } catch (statusErr) {
+      // 3. Fallback: open the mailbox and read its metadata.
+      //    imapflow returns exists/uidNext/uidValidity/unseen on mailboxOpen.
+      //    We use a read-only lock to avoid side effects.
+      try {
+        const lock = await client.getMailboxLock(targetFolder, { readonly: true });
+        try {
+          const mbox = client.mailbox;
+          if (!mbox || typeof mbox === 'boolean') {
+            throw new Error('Mailbox metadata unavailable after open');
+          }
+          return {
+            messages: Number((mbox as any).exists ?? 0),
+            recent: Number((mbox as any).recent ?? 0),
+            unseen: Number((mbox as any).unseen ?? 0),
+            uidValidity: Number((mbox as any).uidValidity ?? 0),
+            uidNext: Number((mbox as any).uidNext ?? 0),
+          };
+        } finally {
+          lock.release();
+        }
+      } catch (openErr) {
+        const statusMsg = statusErr instanceof Error ? statusErr.message : String(statusErr);
+        const openMsg = openErr instanceof Error ? openErr.message : String(openErr);
+        throw new Error(
+          `Failed to get status for folder "${targetFolder}". ` +
+          `STATUS failed: ${statusMsg}. Fallback (mailboxOpen) failed: ${openMsg}.`
+        );
+      }
+    }
+  }
+
+  private async collectFolderPaths(client: ImapFlow): Promise<string[]> {
+    const list = await client.list();
+    return list.map(f => f.path);
+  }
+
+  /**
+   * Resolves a requested folder name against the server's actual folder list.
+   * - Exact match wins.
+   * - Case-insensitive match is accepted as a fallback.
+   * - Otherwise returns up to 3 closest suggestions (by Levenshtein distance).
+   */
+  private resolveFolderName(
+    requested: string,
+    available: string[]
+  ): { match: string | null; suggestions: string[] } {
+    if (available.includes(requested)) {
+      return { match: requested, suggestions: [] };
+    }
+    const lower = requested.toLowerCase();
+    const ci = available.find(p => p.toLowerCase() === lower);
+    if (ci) {
+      return { match: ci, suggestions: [] };
+    }
+    const scored = available
+      .map(name => ({ name, dist: levenshtein(requested.toLowerCase(), name.toLowerCase()) }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 3)
+      .filter(s => s.dist <= Math.max(3, Math.floor(requested.length / 2)))
+      .map(s => s.name);
+    return { match: null, suggestions: scored };
   }
 
   async searchEmails(accountId: string, folderName: string, criteria: SearchCriteria): Promise<EmailMessage[]> {
